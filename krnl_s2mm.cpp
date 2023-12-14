@@ -1,0 +1,185 @@
+/**********
+Copyright (c) 2019-2020, Xilinx, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+may be used to endorse or promote products derived from this software
+without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE,
+EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+**********/
+/* This is a stream to memory mapped data mover kernel which takes input from a
+stream and writes data
+to global memory via memory mapped interface */
+#include "byte_stream.h"
+#include "ap_axi_sdata.h"
+#include "ap_int.h"
+#include "hls_stream.h"
+
+
+#define DWIDTH 512
+#define TDWIDTH 16
+
+typedef ap_axiu<DWIDTH, 1, 1, TDWIDTH> pkt;
+
+typedef struct {char data,d1; bool last;} char_s;
+typedef struct {int data; bool last;} int_s;
+
+
+
+char pattern_vector[100][5]= {">","XTND", "DELE", "CAL ", "USR ", ".php", "ST",\
+		 "<!", "BM", "MZ", "PK", "FC", "l44", "CWD", "CEL", "MKD", "%20",\
+		 "%1u", ".pl", "403", "../", "/%%", "CMD", "PWD", "200", "RMD", "TOP",\
+		 ".ra", ".rt", ".rp", "GET", "PUT", "RQS", "GNT", "try", "302", "op=",\
+		 ".ld", "/20", "sms", "/x.", "EMF", "307", "/v1", "856", "host", "USER",\
+		 "r00t", "rewt", "wank", "1234", "PONG", "ping", "pong", "root", "|00|",\
+		 "|3B|", "|7C|", "RETR", "SITE", "PASS", "530 ", "GET ", "MSGS", "STOR",\
+		 "HELP", "expn", "vrfy", "_RLD", "/csh", "/ksh", "/rsh", "/phf", "POST",\
+		 ".cnf", ".htr", ".htw", ".jsp", "cd..","cat ", "?wp-",".ida", ".idq",\
+		 "/zsh", "STAT", "/swc", "|13|", "HELO", "ETRN", ".asp", "MODE", "SYST",\
+		 "APOP", "|3A|", "SSH-", "LIST", "uid=", "LSUB", "FIND", "AUTH"};
+
+void workflow(hls::stream<int_s>& dst,int_s w,char shiftreg[32]){
+		for (int pattern_index = 0; pattern_index < 100; pattern_index++) {
+			#pragma HLS UNROLL
+			int i=0;
+				bool PatterndMatch = true;
+				while(pattern_vector[pattern_index][i]!='\0'){
+					i+=1;
+				}
+				for (int char_index = 0; char_index < i; char_index++) {
+				#pragma HLS UNROLL
+					if (shiftreg[28 + char_index] != pattern_vector[pattern_index][char_index] && shiftreg[27 + char_index] != pattern_vector[pattern_index][char_index] ) {
+						PatterndMatch = false;
+					break;
+					}
+
+				}
+
+				if (PatterndMatch) {
+					printf("%s\n", pattern_vector[pattern_index]);
+					//printf("%c%c%c%c\n", shiftreg[28], shiftreg[29], shiftreg[30], shiftreg[31]);
+				    printf("Matched!!!\n");
+					w.data = pattern_index + 1;
+					w.last = false;
+					dst.write(w);
+				}
+		 }
+
+}
+
+
+void producer(hls::stream<pkt>& src, hls::stream<char_s>& dst, unsigned size) {
+	for (unsigned t = 0; t < size; ++t) {
+		const pkt pkt = src.read();
+		for (unsigned j = 0; j < BYTES_PER_PKT-1; j+=2) {
+			#pragma HLS UNROLL
+			char_s p;
+			p.data = pkt.data.range((j+1)*8-1, j*8);
+			p.d1 = pkt.data.range((j+2)*8-1, (j+1)*8);
+			p.last = (t+1 == size) && (j+2 == BYTES_PER_PKT);
+			dst.write(p);
+		}
+	}
+}
+
+
+void process(hls::stream<char_s>& src, hls::stream<int_s>& dst) {
+	char shiftreg[32] = {0};
+	char_s r;
+	int_s w;
+
+
+	do {
+		#pragma HLS performance target_ti=1
+		for (unsigned i = 0; i < 30; ++i) {
+			#pragma HLS UNROLL
+			shiftreg[i] = shiftreg[i+2];
+			//shiftreg[i+1] = shiftreg[i+2];
+
+
+		}
+		r = src.read();
+		shiftreg[30] = r.data;
+		shiftreg[31] = r.d1;
+		//printf("%c\n",shiftreg[31]);
+
+		workflow(dst,w,shiftreg);
+
+
+
+	} while (!r.last);
+
+	w.last = true;
+	w.data = 255;
+	dst.write(w);
+
+}
+
+unsigned consumer(hls::stream<int_s>& src, ap_uint<32>* out) {
+	int_s r;
+	unsigned i = 0;
+	do {
+#pragma HLS performance target_ti=1
+		r = src.read();
+		out[i] = r.data;
+		i++;
+		} while (!r.last);
+	return i;
+}
+
+
+unsigned krnl_s2mm(ap_uint<32> *out,     // Write only memory mapped
+               hls::stream<pkt> &n2k,    // Internal Stream
+               unsigned int     size     // Size in bytes
+               ) {
+#pragma HLS INTERFACE m_axi port = out offset = slave bundle = gmem depth=512
+#pragma HLS INTERFACE axis port = n2k
+#pragma HLS INTERFACE s_axilite port = out bundle = control
+#pragma HLS INTERFACE s_axilite port = size bundle = control
+#pragma HLS INTERFACE s_axilite port = return bundle = control
+
+
+
+	    hls::stream<char_s> channel1;
+		hls::stream<int_s> channel2;
+
+		#pragma HLS STREAM variable=channel1
+		#pragma HLS STREAM variable=channel2
+		#pragma HLS DATAFLOW
+
+		producer(n2k, channel1, size);
+		process(channel1, channel2);
+		return consumer(channel2, out);
+	}
+
+
+
+
+
+
+
